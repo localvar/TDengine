@@ -74,6 +74,8 @@ HttpContext *httpCreateContext(HttpServer *pServer) {
   pContext->httpVersion = HTTP_VERSION_10;
   pContext->lastAccessTime = taosGetTimestampSec();
   if (pthread_mutex_init(&(pContext->mutex), NULL) < 0) {
+    // behavior of unlock and destory uninitialized mutex?
+    // but should not be a big problem
     httpFreeContext(pServer, pContext);
     return NULL;
   }
@@ -182,8 +184,14 @@ void httpCloseContextByApp(HttpContext *pContext) {
     return;
   }
 
+  // the lock operation could be an unexpected behavior
   pthread_mutex_lock(&pContext->mutex);
+  // even signature check passes, it does not mean the context is
+  // the one we desired because the memory could be reused for a new
+  // context. per memory pool implementation, problem possibility is high
+  // when the memory pool is nearly empty.
   if (pContext->signature != pContext) {
+    // but, the mutex is locked...
     return;
   }
   
@@ -207,6 +215,7 @@ void httpCloseContextByApp(HttpContext *pContext) {
   }
 }
 
+// same issue as `httpCloseContextByApp`
 void httpCloseContextByServer(HttpThread *pThread, HttpContext *pContext) {
   if (pContext->signature != pContext || pContext->pThread != pThread) {
     return;
@@ -290,6 +299,8 @@ bool httpReadDataImp(HttpContext *pContext) {
     } else if (nread < 0) {
       if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
         if (blocktimes++ > HTTP_READ_RETRY_TIMES) {
+          // because of the threading model, an attacker could utilize the `sleep` here to make an attack
+          // which will greatly impact thoughput
           taosMsleep(HTTP_READ_WAIT_TIME_MS);
           httpTrace("context:%p, fd:%d, ip:%s, read from socket error:%d, error times:%d",
                     pContext, pContext->fd, pContext->ipstr, errno, blocktimes);
@@ -314,6 +325,7 @@ bool httpReadDataImp(HttpContext *pContext) {
     }
   }
 
+  // pParser->bufsize == HTTP_BUFFER_SIZE
   pParser->buffer[pParser->bufsize] = 0;
   httpTrace("context:%p, fd:%d, ip:%s, thread:%s, read size:%d",
             pContext, pContext->fd, pContext->ipstr, pContext->pThread->label, pParser->bufsize);
@@ -367,7 +379,11 @@ bool httpReadData(HttpThread *pThread, HttpContext *pContext) {
   }
 
   int ret = httpCheckReadCompleted(pContext);
+  // could HTTP_CHECK_BODY_CONTINUE for a very long time?
+  // what's the result if this happens?
   if (ret == HTTP_CHECK_BODY_CONTINUE) {
+    // this timer causes many many race issues, most code related to a `HttpContext` is vulnerable
+    // for example, if the timer fires during the execution of this function(httpReadData)...
     taosTmrReset(httpCloseContextByServerFromTimer, HTTP_EXPIRED_TIME, pContext, pThread->pServer->timerHandle, &pContext->readTimer);
     httpTrace("context:%p, fd:%d, ip:%s, not finished yet, try another times, readTimer:%p", pContext, pContext->fd, pContext->ipstr, pContext->readTimer);
     return false;
@@ -398,6 +414,7 @@ void httpProcessHttpData(void *param) {
   pthread_sigmask(SIG_SETMASK, &set, NULL);
 
   while (1) {
+    // why use a condition variable instead of make epoll_wait to wait indefinitely?
     pthread_mutex_lock(&pThread->threadMutex);
     if (pThread->numOfFds < 1) {
       pthread_cond_wait(&pThread->fdReady, &pThread->threadMutex);
@@ -462,6 +479,9 @@ void httpProcessHttpData(void *param) {
 
       __sync_fetch_and_add(&pThread->pServer->requestNum, 1);
 
+      // another major cause of race issues, after processData returns,
+      // pContext may be reused in another epoll event, but it is also being
+      // used in async calls from other threads
       if (!(*(pThread->processData))(pContext)) {
         httpCloseContextByServer(pThread, pContext);
       }
@@ -541,7 +561,8 @@ void httpAcceptHttpConnection(void *arg) {
 
     // notify the data process, add into the FdObj list
     pthread_mutex_lock(&(pThread->threadMutex));
-
+    // race, these works should be done before `epoll_ctl`
+    // btw, the link list seems useless and can be totally removed
     pContext->next = pThread->pHead;
 
     if (pThread->pHead) (pThread->pHead)->prev = pContext;
@@ -598,6 +619,7 @@ bool httpInitConnect(HttpServer *pServer) {
       return false;
     }
 
+    // should move these 2 lines before the loop and remove same lines after the loop
     pthread_attr_init(&thattr);
     pthread_attr_setdetachstate(&thattr, PTHREAD_CREATE_JOINABLE);
     if (pthread_create(&(pThread->thread), &thattr, (void *)httpProcessHttpData, (void *)(pThread)) != 0) {

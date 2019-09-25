@@ -28,6 +28,7 @@
 #include "ttimer.h"
 
 void httpAccessSession(HttpContext *pContext) {
+  // race, session expired
   if (pContext->session == pContext->session->signature)
     pContext->session->expire = (int)taosGetTimestampSec() + pContext->pThread->pServer->sessionExpire;
 }
@@ -53,6 +54,7 @@ void httpCreateSession(HttpContext *pContext, void *taos) {
     httpError("context:%p, fd:%d, ip:%s, user:%s, error:%s", pContext, pContext->fd, pContext->ipstr, pContext->user,
               httpMsg[HTTP_SESSION_FULL]);
     taos_close(taos);
+    // should return here
   }
 
   pContext->session->signature = pContext->session;
@@ -86,6 +88,10 @@ void httpRestoreSession(HttpContext *pContext) {
   if (session == NULL || session != session->signature) return;
 
   pthread_mutex_lock(&server->serverMutex);
+  // race, session may already be freed
+  // note it is incorrect even add below check
+  //   if (session == session->signature)
+  // because same memory could be reused by new session
   session->access--;
   httpTrace("context:%p, ip:%s, user:%s, restore session:%p:%s:%p, access:%d, expire:%d",
             pContext, pContext->ipstr, pContext->user, session, session->id, session->taos,
@@ -127,7 +133,7 @@ bool httpInitAllSessions(HttpServer *pServer) {
 
 int httpSessionExpired(char *session) {
   HttpSession *pSession = (HttpSession *)session;
-  time_t       cur = time(NULL);
+  time_t       cur = time(NULL);  // should use `taosGetTimestampSec` to be consistent with other code
 
   if (pSession->taos != NULL) {
     if (pSession->expire > cur) {
@@ -150,6 +156,7 @@ void httpRemoveExpireSessions(HttpServer *pServer) {
   do {
     pthread_mutex_lock(&pServer->serverMutex);
 
+    // low performance if there are many sessions
     HttpSession *pSession = (HttpSession *)taosVisitStrHashWithFp(pServer->pSessionHash, httpSessionExpired);
     if (pSession == NULL) {
       pthread_mutex_unlock(&pServer->serverMutex);

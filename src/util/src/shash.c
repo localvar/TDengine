@@ -223,6 +223,7 @@ void *taosGetStrHashData(void *handle, char *string) {
   return NULL;
 }
 
+// the first parameter should be named `maxSlots` instead of `maxSessions`
 void *taosInitStrHash(uint32_t maxSessions, uint32_t dataSize, uint32_t (*fp)(void *, char *)) {
   SHashObj *pObj;
 
@@ -255,6 +256,9 @@ void taosCleanUpStrHashWithFp(void *handle, void (*fp)(char *)) {
   pObj = (SHashObj *)handle;
   if (pObj == NULL || pObj->maxSessions <= 0) return;
 
+  // does not make sense to lock the mutex in this function.
+  // must guarantee that no other thread will access pObj,
+  // this is a bug otherwise even with the lock.
   pthread_mutex_lock(&pObj->mutex);
 
   if (pObj->hashList) {

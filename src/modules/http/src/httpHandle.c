@@ -262,6 +262,7 @@ bool httpParseChunkedBody(HttpContext* pContext, HttpParser* pParser, bool test)
   }
 
   if (!test) {
+    // maybe need update bufsize? not sure about this
     *pRet = '\0';
   }
 
